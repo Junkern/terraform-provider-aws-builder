@@ -1,0 +1,213 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION_FILE: go.mod
+  SOURCE_VERSION: v6.64.0
+
+jobs:
+  go-checks:
+    name: Go checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache: true
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
+      - name: Run tests
+        run: go test -race ./...
+      - name: Run vet
+        run: go vet ./...
+      - name: Run golint
+        run: go run golang.org/x/lint/golint@latest ./...
+      - name: Build CLI
+        run: go build -trimpath -buildvcs=false ./...
+
+  build-s3:
+    name: Build S3 provider
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache: true
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+      - name: Build and validate provider
+        run: |
+          go build -trimpath -buildvcs=false -o aws-provider-build .
+          ./aws-provider-build \
+            --source-version "$SOURCE_VERSION" \
+            --services s3 \
+            --output ./dist
+      - name: Verify build metadata
+        run: |
+          test -s dist/terraform-provider-aws-slim
+          test -s dist/terraform-provider-aws-slim.build.json
+          grep -Eq '"source_commit": "[0-9a-f]{40}"' dist/terraform-provider-aws-slim.build.json
+          grep -Eq '"sha256": "[0-9a-f]{64}"' dist/terraform-provider-aws-slim.build.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: aws-provider-slim-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  schema-test:
+    name: Test provider artifact schema
+    needs: build-s3
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+      - uses: actions/download-artifact@v7
+        with:
+          name: aws-provider-slim-${{ github.sha }}
+          path: dist
+      - run: ls -l dist
+      - name: Make provider executable
+        run: chmod +x dist/terraform-provider-aws-slim
+      - name: Check S3-only schema
+        shell: bash
+        run: |
+          set -euo pipefail
+          check_dir="$(mktemp -d)"
+          trap 'rm -rf "$check_dir"' EXIT
+          cat >"$check_dir/main.tf" <<'EOF'
+          terraform {
+            required_providers {
+              aws = {
+                source = "local/aws-slim"
+                version = "0.0.0"
+              }
+            }
+          }
+
+          provider "aws" {
+            region = "us-east-1"
+            skip_requesting_account_id = true
+          }
+
+          resource "aws_s3_bucket" "check" {
+            bucket = "schema-only"
+          }
+
+          data "aws_s3_bucket" "source_check" {
+            bucket = "schema-only"
+          }
+          EOF
+          cat >"$HOME/.terraformrc" <<EOF
+          provider_installation {
+            dev_overrides {
+              "local/aws-slim" = "$(pwd)/dist"
+            }
+            direct {}
+          }
+          EOF
+          export TF_CLI_CONFIG_FILE="$HOME/.terraformrc"
+          terraform -chdir="$check_dir" providers schema -json >"$check_dir/schema.json"
+          grep -q '"aws_s3_bucket"' "$check_dir/schema.json"
+          grep -q '"aws_s3_bucket"' "$check_dir/main.tf"
+          cat >"$check_dir/unsupported.tf" <<'EOF'
+          resource "aws_instance" "must_not_exist" {
+            ami = "ami-schema-only"
+            instance_type = "t3.micro"
+          }
+          EOF
+          validation_output=$(terraform -chdir="$check_dir" validate -no-color 2>&1 || true)
+          if grep -q 'Invalid resource type' <<<"$validation_output"; then
+            exit 0
+          fi
+          printf '%s\n' "$validation_output"
+          echo "aws_instance unexpectedly exists in the slim provider"
+          exit 1
+
+  s3-acceptance:
+    name: Real S3 acceptance test
+    if: github.event_name == 'workflow_dispatch'
+    needs: build-s3
+    runs-on: ubuntu-latest
+    environment: aws-acceptance
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+      - uses: actions/download-artifact@v5
+        with:
+          name: aws-provider-slim-${{ github.sha }}
+          path: dist
+      - name: Make provider executable
+        run: chmod +x dist/terraform-provider-aws-slim
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ACCEPTANCE_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Create and destroy an S3 bucket
+        shell: bash
+        env:
+          BUCKET_NAME: aws-slim-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          test "$BUCKET_NAME" != "aws-slim-ci--"
+          test -s dist/terraform-provider-aws-slim
+          test -s dist/terraform-provider-aws-slim.build.json
+          test_dir="$(mktemp -d)"
+          trap 'terraform -chdir="$test_dir" destroy -auto-approve -no-color || true; rm -rf "$test_dir"' EXIT
+          cat >"$test_dir/main.tf" <<'EOF'
+          terraform {
+            required_providers {
+              aws = {
+                source = "local/aws-slim"
+                version = "0.0.0"
+              }
+            }
+          }
+
+          variable "bucket_name" {
+            type = string
+          }
+
+          provider "aws" {
+            region = "us-east-1"
+          }
+
+          resource "aws_s3_bucket" "acceptance" {
+            bucket = var.bucket_name
+          }
+          EOF
+          cat >"$test_dir/.terraformrc" <<EOF
+          provider_installation {
+            dev_overrides {
+              "local/aws-slim" = "$(pwd)/dist"
+            }
+            direct {}
+          }
+          EOF
+          export TF_CLI_CONFIG_FILE="$test_dir/.terraformrc"
+          export TF_VAR_bucket_name="$BUCKET_NAME"
+          terraform -chdir="$test_dir" init -input=false -no-color
+          terraform -chdir="$test_dir" apply -auto-approve -input=false -no-color
+          terraform -chdir="$test_dir" show -no-color
